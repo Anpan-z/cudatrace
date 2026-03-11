@@ -149,9 +149,7 @@ impl Config {
     pub fn should_deref_ioctl(&self, ioctl_name: &str) -> bool {
         self.ioctl_deref
             && (self.ioctl_deref_targets.is_empty()
-                || self
-                    .ioctl_deref_targets
-                    .contains(&normalize(ioctl_name)))
+                || self.ioctl_deref_targets.contains(&normalize(ioctl_name)))
     }
 
     fn from_lookup<F>(lookup: F) -> Self
@@ -273,33 +271,26 @@ fn parse_deref_ioctl_targets(value: Option<&str>) -> HashSet<String> {
 }
 
 fn parse_max_depth(value: Option<&str>) -> usize {
-    value
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_MAX_DEPTH)
-        .min(MAX_DEPTH_CAP)
+    parse_capped_usize(value, DEFAULT_MAX_DEPTH, MAX_DEPTH_CAP)
 }
 
 fn parse_max_bytes(value: Option<&str>) -> usize {
-    value
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_MAX_BYTES)
-        .min(MAX_BYTES_CAP)
+    parse_capped_usize(value, DEFAULT_MAX_BYTES, MAX_BYTES_CAP)
 }
 
 fn parse_hexdump_len(value: Option<&str>) -> usize {
+    parse_capped_usize(value, DEFAULT_HEXDUMP_LEN, MAX_HEXDUMP_LEN_CAP)
+}
+
+fn parse_capped_usize(value: Option<&str>, default: usize, cap: usize) -> usize {
     value
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .and_then(|v| v.parse::<usize>().ok())
+        // Zero keeps behavior simple and avoids "disabled means empty output" ambiguity.
         .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_HEXDUMP_LEN)
-        .min(MAX_HEXDUMP_LEN_CAP)
+        .unwrap_or(default)
+        .min(cap)
 }
 
 fn parse_time_unit(value: Option<&str>) -> TimeUnit {

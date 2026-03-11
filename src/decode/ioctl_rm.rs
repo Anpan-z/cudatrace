@@ -1,8 +1,22 @@
 use crate::config::IoctlDecodeMode;
-use crate::decode::ioctl::{DecodeSummary, IoctlMeta, hex_bytes, read_bytes, read_pod};
-use crate::decode::ioctl_json::{JsonObject, json_quote};
+use crate::decode::ioctl::{hex_bytes, read_bytes, read_pod, DecodeSummary, IoctlMeta};
+use crate::decode::ioctl_json::{json_quote, JsonObject};
 use crate::decode::nvidia::{
-    NV_ESC_ALLOC_OS_EVENT, NV_ESC_ATTACH_GPUS_TO_FD, NV_ESC_CARD_INFO, NV_ESC_CHECK_VERSION_STR,
+    Nv0000CtrlClientGetAddrSpaceTypeParams, Nv0000CtrlOsUnixGetControlFileDescriptorParams,
+    Nv0000CtrlSystemGetBuildVersionParams, NvIoctlAllocOsEvent, NvIoctlCardInfo,
+    NvIoctlExportToDmaBufFdPrefix, NvIoctlNumaInfo, NvIoctlNvos02ParametersWithFd,
+    NvIoctlNvos33ParametersWithFd, NvIoctlQueryDeviceIntr, NvIoctlRegisterFd, NvIoctlRmApiVersion,
+    NvIoctlSetNumaStatus, NvIoctlStatusCode, NvIoctlSysParams, NvIoctlWaitOpenComplete,
+    NvIoctlXfer, NvOs00Parameters, NvOs02Parameters, NvOs05Parameters, NvOs21Parameters,
+    NvOs34Parameters, NvOs54Parameters, NvOs64Parameters,
+    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_FABRIC,
+    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_FABRIC_MC,
+    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_INVALID, NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_REGMEM,
+    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_SYSMEM, NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_VIDMEM,
+    NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE,
+    NV0000_CTRL_CMD_OS_UNIX_GET_CONTROL_FILE_DESCRIPTOR, NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION,
+    NV01_ROOT, NV01_ROOT_CLIENT, NV01_ROOT_NON_PRIV, NV04_CONTROL, NV_ESC_ALLOC_OS_EVENT,
+    NV_ESC_ATTACH_GPUS_TO_FD, NV_ESC_CARD_INFO, NV_ESC_CHECK_VERSION_STR,
     NV_ESC_EXPORT_TO_DMABUF_FD, NV_ESC_FREE_OS_EVENT, NV_ESC_IOCTL_XFER_CMD, NV_ESC_NUMA_INFO,
     NV_ESC_QUERY_DEVICE_INTR, NV_ESC_REGISTER_FD, NV_ESC_RM_ACCESS_REGISTRY,
     NV_ESC_RM_ADD_VBLANK_CALLBACK, NV_ESC_RM_ALLOC, NV_ESC_RM_ALLOC_CONTEXT_DMA2,
@@ -14,20 +28,6 @@ use crate::decode::nvidia::{
     NV_ESC_RM_MAP_MEMORY_DMA, NV_ESC_RM_SHARE, NV_ESC_RM_UNMAP_MEMORY, NV_ESC_RM_UNMAP_MEMORY_DMA,
     NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO, NV_ESC_RM_VID_HEAP_CONTROL, NV_ESC_SET_NUMA_STATUS,
     NV_ESC_STATUS_CODE, NV_ESC_SYS_PARAMS, NV_ESC_WAIT_OPEN_COMPLETE, NV_IOCTL_MAGIC,
-    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_FABRIC,
-    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_FABRIC_MC,
-    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_INVALID, NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_REGMEM,
-    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_SYSMEM, NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_VIDMEM,
-    NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE,
-    NV0000_CTRL_CMD_OS_UNIX_GET_CONTROL_FILE_DESCRIPTOR, NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION,
-    NV01_ROOT, NV01_ROOT_CLIENT, NV01_ROOT_NON_PRIV, NV04_CONTROL,
-    Nv0000CtrlClientGetAddrSpaceTypeParams, Nv0000CtrlOsUnixGetControlFileDescriptorParams,
-    Nv0000CtrlSystemGetBuildVersionParams, NvIoctlAllocOsEvent, NvIoctlCardInfo,
-    NvIoctlExportToDmaBufFdPrefix, NvIoctlNumaInfo, NvIoctlNvos02ParametersWithFd,
-    NvIoctlNvos33ParametersWithFd, NvIoctlQueryDeviceIntr, NvIoctlRegisterFd, NvIoctlRmApiVersion,
-    NvIoctlSetNumaStatus, NvIoctlStatusCode, NvIoctlSysParams, NvIoctlWaitOpenComplete,
-    NvIoctlXfer, NvOs00Parameters, NvOs02Parameters, NvOs05Parameters, NvOs21Parameters,
-    NvOs34Parameters, NvOs54Parameters, NvOs64Parameters,
 };
 use std::cmp::min;
 use std::collections::HashMap;
@@ -47,6 +47,8 @@ const MAX_CTRL_LIST_ITEMS: usize = 64;
 const MAX_INNER_PREVIEW_WORDS: usize = 8;
 const MAX_DEREF_VISITED: usize = 16;
 const MAX_DEREF_PTR_CANDIDATES: usize = 8;
+const USER_PTR_MIN_ADDR: u64 = 0x1000;
+const USER_PTR_CANONICAL_MAX: u64 = 0x0000_8000_0000_0000;
 
 const NV0000_CTRL_CMD_SYSTEM_GET_FABRIC_STATUS: u32 = 0x0136;
 const NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS_MATRIX: u32 = 0x013a;
@@ -1338,11 +1340,20 @@ fn deref_user_pointer(
         return out.finish();
     }
 
-    let cap_len = min(hexdump_len.max(1), *budget);
+    let cap_len = min(hexdump_len, *budget).max(1);
     let desired_len = if depth == 0 {
-        min(prefetched.len(), min(declared_size.max(1), cap_len))
+        let root_len = declared_size.max(1);
+        min(prefetched.len(), min(root_len, cap_len))
     } else {
-        min(declared_size.max(hexdump_len).max(1), cap_len)
+        // declared_size can be zero for opaque pointer fields; in that case still preview
+        // one hexdump window so nested content can be inspected.
+        // For non-zero declared sizes we still read at least one hexdump window.
+        let preferred = if declared_size == 0 {
+            hexdump_len
+        } else {
+            declared_size.max(hexdump_len)
+        };
+        min(preferred.max(1), cap_len)
     };
 
     let bytes = if depth == 0 && !prefetched.is_empty() {
@@ -1381,18 +1392,11 @@ fn deref_user_pointer(
         out.field_raw("u64Words", &render_u64_words(&words));
         out.field_raw(
             "ptrFields",
-            &render_pointer_fields(
-                &words,
-                depth + 1,
-                max_depth,
-                hexdump_len,
-                visited,
-                budget,
-            ),
+            &render_pointer_fields(&words, depth + 1, max_depth, hexdump_len, visited, budget),
         );
     }
 
-    let _ = visited.pop();
+    visited.pop();
     out.finish()
 }
 
@@ -1442,7 +1446,8 @@ fn render_pointer_fields(
 }
 
 fn looks_like_user_pointer(value: u64) -> bool {
-    value >= 0x1000 && value < 0x0000_8000_0000_0000
+    // Heuristic for canonical x86-64 user-space addresses.
+    value >= USER_PTR_MIN_ADDR && value < USER_PTR_CANONICAL_MAX
 }
 
 fn parse_printable_c_string(bytes: &[u8]) -> Option<String> {
@@ -1453,7 +1458,7 @@ fn parse_printable_c_string(bytes: &[u8]) -> Option<String> {
     let raw = &bytes[..nul_pos];
     if !raw
         .iter()
-        .all(|b| b.is_ascii_graphic() || *b == b' ' || *b == b'\t')
+        .all(|b| b.is_ascii_graphic() || *b == b' ' || *b == b'\t' || *b == b'\n' || *b == b'\r')
     {
         return None;
     }
@@ -1462,9 +1467,12 @@ fn parse_printable_c_string(bytes: &[u8]) -> Option<String> {
 
 fn read_bytes_with_fallback(addr: usize, desired_len: usize) -> Option<Vec<u8>> {
     let mut len = desired_len.max(1);
-    while len > 0 {
+    for _ in 0..8 {
         if let Some(bytes) = unsafe { read_bytes(addr, len) } {
             return Some(bytes);
+        }
+        if len == 1 {
+            break;
         }
         len /= 2;
     }
@@ -5047,7 +5055,10 @@ mod tests {
         let mut node = LoopNode { next: 0 };
         node.next = (&node as *const LoopNode) as u64;
         let prefetched = unsafe {
-            std::slice::from_raw_parts((&node as *const LoopNode).cast::<u8>(), size_of::<LoopNode>())
+            std::slice::from_raw_parts(
+                (&node as *const LoopNode).cast::<u8>(),
+                size_of::<LoopNode>(),
+            )
         };
 
         let mut visited = Vec::new();
