@@ -46,6 +46,9 @@ const MAX_NUMA_ADDRESSES: usize = 16;
 const MAX_CTRL_LIST_ITEMS: usize = 64;
 const MAX_INNER_PREVIEW_WORDS: usize = 8;
 const MAX_DEREF_VISITED: usize = 16;
+const MAX_DEREF_CHILDREN: usize = 4;
+const MIN_DEREF_READ_BYTES: usize = 16;
+const MIN_LIKELY_POINTER_ADDR: usize = 0x1000;
 
 const NV0000_CTRL_CMD_SYSTEM_GET_FABRIC_STATUS: u32 = 0x0136;
 const NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS_MATRIX: u32 = 0x013a;
@@ -1524,7 +1527,7 @@ fn decode_rm_access_registry(
             if params.p_binary_data != 0 && params.binary_data_length > 0 {
                 let read_len = min(
                     params.binary_data_length as usize,
-                    min(max_blob.max(16), deref.hexdump_len),
+                    min(max_blob.max(MIN_DEREF_READ_BYTES), deref.hexdump_len),
                 );
                 if let Some(bytes) = unsafe { read_bytes(params.p_binary_data as usize, read_len) } {
                     root.field_str("binaryDataHex", &hex_bytes(&bytes));
@@ -4370,7 +4373,7 @@ fn maybe_add_deref_field(
     }
     let mut state = DerefState {
         visited: Vec::with_capacity(MAX_DEREF_VISITED),
-        remaining_bytes: deref.max_bytes.min(max_blob.max(16)),
+        remaining_bytes: deref.max_bytes.min(max_blob.max(MIN_DEREF_READ_BYTES)),
     };
     let deref_json = deref_pointer_value(params_addr, params_size, deref, 0, &mut state);
     root.field_raw("deref", &deref_json);
@@ -4427,11 +4430,14 @@ fn deref_pointer_value(
     if depth + 1 < cfg.max_depth && bytes.len() >= size_of::<u64>() {
         let mut children = String::from("[");
         let mut first = true;
-        for chunk in bytes.chunks_exact(size_of::<u64>()).take(4) {
+        for chunk in bytes
+            .chunks_exact(size_of::<u64>())
+            .take(MAX_DEREF_CHILDREN)
+        {
             let candidate = u64::from_ne_bytes([
                 chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
             ]) as usize;
-            if candidate < 0x1000 || candidate == addr {
+            if candidate < MIN_LIKELY_POINTER_ADDR || candidate == addr {
                 continue;
             }
             if !first {
