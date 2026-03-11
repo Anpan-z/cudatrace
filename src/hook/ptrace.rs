@@ -2319,6 +2319,7 @@ fn format_ioctl_line(
             arg,
             cfg.ioctl_decode,
             cfg.max_blob,
+            cfg.deref,
             path.map(String::as_str),
         );
         set_decode_target_pid(None);

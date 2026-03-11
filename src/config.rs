@@ -7,6 +7,10 @@ const ENV_PATH: &str = "LIB_CUDATRACE_PATH";
 const ENV_TRACE: &str = "LIB_CUDATRACE_TRACE";
 const ENV_IOCTL_DECODE: &str = "LIB_CUDATRACE_IOCTL_DECODE";
 const ENV_MAX_BLOB: &str = "LIB_CUDATRACE_MAX_BLOB";
+const ENV_DEREF: &str = "LIB_CUDATRACE_DEREF";
+const ENV_MAX_DEREF_DEPTH: &str = "LIB_CUDATRACE_MAX_DEREF_DEPTH";
+const ENV_MAX_DEREF_BYTES: &str = "LIB_CUDATRACE_MAX_DEREF_BYTES";
+const ENV_HEXDUMP_LEN: &str = "LIB_CUDATRACE_HEXDUMP_LEN";
 const ENV_TIME_UNIT: &str = "LIB_CUDATRACE_TIME_UNIT";
 const ENV_LEFT_META: &str = "LIB_CUDATRACE_LEFT_META";
 const ENV_FGRAPH_FUNCS: &str = "LIB_CUDATRACE_FGRAPH_FUNCS";
@@ -15,6 +19,12 @@ const ENV_FGRAPH_BUFFER_KB: &str = "LIB_CUDATRACE_FGRAPH_BUFFER_KB";
 const DEFAULT_PATH: &str = "./cudatrace.output";
 const DEFAULT_MAX_BLOB: usize = 256;
 const MAX_BLOB_CAP: usize = 64 * 1024;
+const DEFAULT_DEREF_ENABLED: bool = true;
+const DEFAULT_MAX_DEREF_DEPTH: usize = 2;
+const DEFAULT_MAX_DEREF_BYTES: usize = 1024;
+const MAX_DEREF_BYTES_CAP: usize = 64 * 1024;
+const DEFAULT_HEXDUMP_LEN: usize = 64;
+const MAX_HEXDUMP_LEN_CAP: usize = 4096;
 const DEFAULT_FGRAPH_BUFFER_KB: usize = 16 * 1024;
 const MIN_FGRAPH_BUFFER_KB: usize = 64;
 const MAX_FGRAPH_BUFFER_KB: usize = 256 * 1024;
@@ -92,6 +102,14 @@ impl TraceMask {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DerefConfig {
+    pub enabled: bool,
+    pub max_depth: usize,
+    pub max_bytes: usize,
+    pub hexdump_len: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub output: OutputMode,
@@ -99,6 +117,7 @@ pub struct Config {
     pub trace: TraceMask,
     pub ioctl_decode: IoctlDecodeMode,
     pub max_blob: usize,
+    pub deref: DerefConfig,
     pub time_unit: TimeUnit,
     pub left_meta: LeftMetaMode,
     pub fgraph_funcs: HashSet<String>,
@@ -140,6 +159,12 @@ impl Config {
         let trace = parse_trace(lookup(ENV_TRACE).as_deref());
         let ioctl_decode = parse_ioctl_decode(lookup(ENV_IOCTL_DECODE).as_deref());
         let max_blob = parse_max_blob(lookup(ENV_MAX_BLOB).as_deref());
+        let deref = parse_deref(
+            lookup(ENV_DEREF).as_deref(),
+            lookup(ENV_MAX_DEREF_DEPTH).as_deref(),
+            lookup(ENV_MAX_DEREF_BYTES).as_deref(),
+            lookup(ENV_HEXDUMP_LEN).as_deref(),
+        );
         let time_unit = parse_time_unit(lookup(ENV_TIME_UNIT).as_deref());
         let left_meta = parse_left_meta(lookup(ENV_LEFT_META).as_deref());
         let fgraph_funcs = parse_fgraph_funcs(lookup(ENV_FGRAPH_FUNCS).as_deref());
@@ -151,6 +176,7 @@ impl Config {
             trace,
             ioctl_decode,
             max_blob,
+            deref,
             time_unit,
             left_meta,
             fgraph_funcs,
@@ -214,6 +240,44 @@ fn parse_max_blob(value: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_MAX_BLOB);
 
     parsed.min(MAX_BLOB_CAP)
+}
+
+fn parse_deref(
+    enabled: Option<&str>,
+    depth: Option<&str>,
+    max_bytes: Option<&str>,
+    hexdump_len: Option<&str>,
+) -> DerefConfig {
+    let enabled = enabled
+        .map(normalize)
+        .map(|v| !matches!(v.as_str(), "0" | "off" | "false" | "no"))
+        .unwrap_or(DEFAULT_DEREF_ENABLED);
+    let max_depth = depth
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_DEREF_DEPTH)
+        .min(8);
+    let max_bytes = max_bytes
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_DEREF_BYTES)
+        .min(MAX_DEREF_BYTES_CAP);
+    let hexdump_len = hexdump_len
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_HEXDUMP_LEN)
+        .min(MAX_HEXDUMP_LEN_CAP);
+    DerefConfig {
+        enabled,
+        max_depth,
+        max_bytes,
+        hexdump_len,
+    }
 }
 
 fn parse_time_unit(value: Option<&str>) -> TimeUnit {
@@ -310,6 +374,15 @@ mod tests {
         assert_eq!(cfg.trace, TraceMask::all());
         assert_eq!(cfg.ioctl_decode, IoctlDecodeMode::Full);
         assert_eq!(cfg.max_blob, 256);
+        assert_eq!(
+            cfg.deref,
+            DerefConfig {
+                enabled: DEFAULT_DEREF_ENABLED,
+                max_depth: DEFAULT_MAX_DEREF_DEPTH,
+                max_bytes: DEFAULT_MAX_DEREF_BYTES,
+                hexdump_len: DEFAULT_HEXDUMP_LEN
+            }
+        );
         assert_eq!(cfg.time_unit, TimeUnit::Us);
         assert_eq!(cfg.left_meta, LeftMetaMode::Off);
         assert!(cfg.fgraph_funcs.is_empty());
@@ -342,6 +415,15 @@ mod tests {
         assert_eq!(cfg.trace, TraceMask::all());
         assert_eq!(cfg.ioctl_decode, IoctlDecodeMode::Full);
         assert_eq!(cfg.max_blob, 256);
+        assert_eq!(
+            cfg.deref,
+            DerefConfig {
+                enabled: DEFAULT_DEREF_ENABLED,
+                max_depth: DEFAULT_MAX_DEREF_DEPTH,
+                max_bytes: DEFAULT_MAX_DEREF_BYTES,
+                hexdump_len: DEFAULT_HEXDUMP_LEN
+            }
+        );
         assert_eq!(cfg.time_unit, TimeUnit::Us);
         assert_eq!(cfg.left_meta, LeftMetaMode::Off);
         assert!(cfg.fgraph_funcs.is_empty());
@@ -402,5 +484,20 @@ mod tests {
 
         map.insert(ENV_FGRAPH_BUFFER_KB, "999999999");
         assert_eq!(parse_from_map(&map).fgraph_buffer_kb, MAX_FGRAPH_BUFFER_KB);
+    }
+
+    #[test]
+    fn parse_deref_controls() {
+        let mut map = HashMap::new();
+        map.insert(ENV_DEREF, "off");
+        map.insert(ENV_MAX_DEREF_DEPTH, "5");
+        map.insert(ENV_MAX_DEREF_BYTES, "2048");
+        map.insert(ENV_HEXDUMP_LEN, "96");
+
+        let cfg = parse_from_map(&map);
+        assert!(!cfg.deref.enabled);
+        assert_eq!(cfg.deref.max_depth, 5);
+        assert_eq!(cfg.deref.max_bytes, 2048);
+        assert_eq!(cfg.deref.hexdump_len, 96);
     }
 }
