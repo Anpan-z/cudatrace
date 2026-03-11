@@ -1,8 +1,22 @@
 use crate::config::IoctlDecodeMode;
-use crate::decode::ioctl::{DecodeSummary, IoctlMeta, hex_bytes, read_bytes, read_pod};
-use crate::decode::ioctl_json::JsonObject;
+use crate::decode::ioctl::{hex_bytes, read_bytes, read_pod, DecodeSummary, IoctlMeta};
+use crate::decode::ioctl_json::{json_quote, JsonObject};
 use crate::decode::nvidia::{
-    NV_ESC_ALLOC_OS_EVENT, NV_ESC_ATTACH_GPUS_TO_FD, NV_ESC_CARD_INFO, NV_ESC_CHECK_VERSION_STR,
+    Nv0000CtrlClientGetAddrSpaceTypeParams, Nv0000CtrlOsUnixGetControlFileDescriptorParams,
+    Nv0000CtrlSystemGetBuildVersionParams, NvIoctlAllocOsEvent, NvIoctlCardInfo,
+    NvIoctlExportToDmaBufFdPrefix, NvIoctlNumaInfo, NvIoctlNvos02ParametersWithFd,
+    NvIoctlNvos33ParametersWithFd, NvIoctlQueryDeviceIntr, NvIoctlRegisterFd, NvIoctlRmApiVersion,
+    NvIoctlSetNumaStatus, NvIoctlStatusCode, NvIoctlSysParams, NvIoctlWaitOpenComplete,
+    NvIoctlXfer, NvOs00Parameters, NvOs02Parameters, NvOs05Parameters, NvOs21Parameters,
+    NvOs34Parameters, NvOs54Parameters, NvOs64Parameters,
+    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_FABRIC,
+    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_FABRIC_MC,
+    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_INVALID, NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_REGMEM,
+    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_SYSMEM, NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_VIDMEM,
+    NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE,
+    NV0000_CTRL_CMD_OS_UNIX_GET_CONTROL_FILE_DESCRIPTOR, NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION,
+    NV01_ROOT, NV01_ROOT_CLIENT, NV01_ROOT_NON_PRIV, NV04_CONTROL, NV_ESC_ALLOC_OS_EVENT,
+    NV_ESC_ATTACH_GPUS_TO_FD, NV_ESC_CARD_INFO, NV_ESC_CHECK_VERSION_STR,
     NV_ESC_EXPORT_TO_DMABUF_FD, NV_ESC_FREE_OS_EVENT, NV_ESC_IOCTL_XFER_CMD, NV_ESC_NUMA_INFO,
     NV_ESC_QUERY_DEVICE_INTR, NV_ESC_REGISTER_FD, NV_ESC_RM_ACCESS_REGISTRY,
     NV_ESC_RM_ADD_VBLANK_CALLBACK, NV_ESC_RM_ALLOC, NV_ESC_RM_ALLOC_CONTEXT_DMA2,
@@ -14,20 +28,6 @@ use crate::decode::nvidia::{
     NV_ESC_RM_MAP_MEMORY_DMA, NV_ESC_RM_SHARE, NV_ESC_RM_UNMAP_MEMORY, NV_ESC_RM_UNMAP_MEMORY_DMA,
     NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO, NV_ESC_RM_VID_HEAP_CONTROL, NV_ESC_SET_NUMA_STATUS,
     NV_ESC_STATUS_CODE, NV_ESC_SYS_PARAMS, NV_ESC_WAIT_OPEN_COMPLETE, NV_IOCTL_MAGIC,
-    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_FABRIC,
-    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_FABRIC_MC,
-    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_INVALID, NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_REGMEM,
-    NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_SYSMEM, NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_VIDMEM,
-    NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE,
-    NV0000_CTRL_CMD_OS_UNIX_GET_CONTROL_FILE_DESCRIPTOR, NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION,
-    NV01_ROOT, NV01_ROOT_CLIENT, NV01_ROOT_NON_PRIV, NV04_CONTROL,
-    Nv0000CtrlClientGetAddrSpaceTypeParams, Nv0000CtrlOsUnixGetControlFileDescriptorParams,
-    Nv0000CtrlSystemGetBuildVersionParams, NvIoctlAllocOsEvent, NvIoctlCardInfo,
-    NvIoctlExportToDmaBufFdPrefix, NvIoctlNumaInfo, NvIoctlNvos02ParametersWithFd,
-    NvIoctlNvos33ParametersWithFd, NvIoctlQueryDeviceIntr, NvIoctlRegisterFd, NvIoctlRmApiVersion,
-    NvIoctlSetNumaStatus, NvIoctlStatusCode, NvIoctlSysParams, NvIoctlWaitOpenComplete,
-    NvIoctlXfer, NvOs00Parameters, NvOs02Parameters, NvOs05Parameters, NvOs21Parameters,
-    NvOs34Parameters, NvOs54Parameters, NvOs64Parameters,
 };
 use std::cmp::min;
 use std::collections::HashMap;
@@ -45,6 +45,10 @@ mod generated_nvidia_ioctl_tables {
 const MAX_NUMA_ADDRESSES: usize = 16;
 const MAX_CTRL_LIST_ITEMS: usize = 64;
 const MAX_INNER_PREVIEW_WORDS: usize = 8;
+const MAX_DEREF_VISITED: usize = 16;
+const MAX_DEREF_PTR_CANDIDATES: usize = 8;
+const USER_PTR_MIN_ADDR: u64 = 0x1000;
+const USER_PTR_CANONICAL_MAX: u64 = 0x0000_8000_0000_0000;
 
 const NV0000_CTRL_CMD_SYSTEM_GET_FABRIC_STATUS: u32 = 0x0136;
 const NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS_MATRIX: u32 = 0x013a;
@@ -1281,9 +1285,198 @@ fn decode_alloc_blob(params_ptr: u64, params_size: usize, max_blob: usize, root:
     if let Some(bytes) = unsafe { read_bytes(params_ptr as usize, read_len) } {
         root.field_str("allocParamsBlobHex", &hex_bytes(&bytes));
         root.field_bool("allocParamsTruncated", read_len < params_size);
+        let cfg = crate::config::global();
+        if cfg.should_deref_ioctl("ioctl_rm") {
+            let mut visited = Vec::with_capacity(MAX_DEREF_VISITED);
+            let mut budget = cfg.ioctl_deref_max_bytes;
+            let deref_json = deref_user_pointer(
+                params_ptr,
+                params_size,
+                0,
+                cfg.ioctl_deref_max_depth,
+                cfg.ioctl_deref_hexdump_len,
+                &bytes,
+                &mut visited,
+                &mut budget,
+            );
+            root.field_raw("allocParamsDeref", &deref_json);
+        }
     } else {
         root.field_str("allocParamsStatus", "unreadable");
     }
+}
+
+fn deref_user_pointer(
+    addr: u64,
+    declared_size: usize,
+    depth: usize,
+    max_depth: usize,
+    hexdump_len: usize,
+    prefetched: &[u8],
+    visited: &mut Vec<u64>,
+    budget: &mut usize,
+) -> String {
+    let mut out = JsonObject::new();
+    out.field_str("addr", &format!("0x{addr:x}"));
+
+    if addr == 0 {
+        out.field_str("status", "null");
+        return out.finish();
+    }
+    if depth >= max_depth {
+        out.field_str("status", "max_depth_reached");
+        return out.finish();
+    }
+    if visited.contains(&addr) {
+        out.field_str("status", "cycle_detected");
+        return out.finish();
+    }
+    if visited.len() >= MAX_DEREF_VISITED {
+        out.field_str("status", "visited_limit_exceeded");
+        return out.finish();
+    }
+    if *budget == 0 {
+        out.field_str("status", "max_bytes_exceeded");
+        return out.finish();
+    }
+
+    let cap_len = min(hexdump_len, *budget).max(1);
+    let desired_len = if depth == 0 {
+        let root_len = declared_size.max(1);
+        min(prefetched.len(), min(root_len, cap_len))
+    } else {
+        // declared_size can be zero for opaque pointer fields; in that case still preview
+        // one hexdump window so nested content can be inspected.
+        // For non-zero declared sizes we still read at least one hexdump window.
+        let preferred = if declared_size == 0 {
+            hexdump_len
+        } else {
+            declared_size.max(hexdump_len)
+        };
+        min(preferred.max(1), cap_len)
+    };
+
+    let bytes = if depth == 0 && !prefetched.is_empty() {
+        prefetched[..desired_len].to_vec()
+    } else if let Some(bytes) = read_bytes_with_fallback(addr as usize, desired_len) {
+        bytes
+    } else {
+        out.field_str("status", "unreadable");
+        return out.finish();
+    };
+
+    visited.push(addr);
+    *budget = budget.saturating_sub(bytes.len());
+
+    out.field_str("status", "ok");
+    out.field_u64("readLen", bytes.len() as u64);
+    out.field_str("bytesHex", &hex_bytes(&bytes));
+    if declared_size > bytes.len() {
+        out.field_bool("truncated", true);
+    }
+
+    if let Some(text) = parse_printable_c_string(&bytes) {
+        out.field_str("string", &text);
+    }
+
+    let words: Vec<u64> = bytes
+        .chunks_exact(size_of::<u64>())
+        .take(MAX_INNER_PREVIEW_WORDS)
+        .map(|chunk| {
+            let mut raw = [0_u8; size_of::<u64>()];
+            raw.copy_from_slice(chunk);
+            u64::from_ne_bytes(raw)
+        })
+        .collect();
+    if !words.is_empty() {
+        out.field_raw("u64Words", &render_u64_words(&words));
+        out.field_raw(
+            "ptrFields",
+            &render_pointer_fields(&words, depth + 1, max_depth, hexdump_len, visited, budget),
+        );
+    }
+
+    visited.pop();
+    out.finish()
+}
+
+fn render_u64_words(words: &[u64]) -> String {
+    let values = words
+        .iter()
+        .map(|word| json_quote(&format!("0x{word:x}")))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{values}]")
+}
+
+fn render_pointer_fields(
+    words: &[u64],
+    depth: usize,
+    max_depth: usize,
+    hexdump_len: usize,
+    visited: &mut Vec<u64>,
+    budget: &mut usize,
+) -> String {
+    let mut fields = Vec::new();
+    for (idx, word) in words.iter().enumerate() {
+        if fields.len() >= MAX_DEREF_PTR_CANDIDATES {
+            break;
+        }
+        if !looks_like_user_pointer(*word) {
+            continue;
+        }
+
+        let mut item = JsonObject::new();
+        item.field_u64("wordIndex", idx as u64);
+        item.field_str("addr", &format!("0x{word:x}"));
+        let nested = deref_user_pointer(
+            *word,
+            hexdump_len,
+            depth,
+            max_depth,
+            hexdump_len,
+            &[],
+            visited,
+            budget,
+        );
+        item.field_raw("value", &nested);
+        fields.push(item.finish());
+    }
+    format!("[{}]", fields.join(","))
+}
+
+fn looks_like_user_pointer(value: u64) -> bool {
+    // Heuristic for canonical x86-64 user-space addresses.
+    value >= USER_PTR_MIN_ADDR && value < USER_PTR_CANONICAL_MAX
+}
+
+fn parse_printable_c_string(bytes: &[u8]) -> Option<String> {
+    let nul_pos = bytes.iter().position(|b| *b == 0)?;
+    if nul_pos == 0 {
+        return None;
+    }
+    let raw = &bytes[..nul_pos];
+    if !raw
+        .iter()
+        .all(|b| b.is_ascii_graphic() || *b == b' ' || *b == b'\t' || *b == b'\n' || *b == b'\r')
+    {
+        return None;
+    }
+    std::str::from_utf8(raw).ok().map(ToOwned::to_owned)
+}
+
+fn read_bytes_with_fallback(addr: usize, desired_len: usize) -> Option<Vec<u8>> {
+    let mut len = desired_len.max(1);
+    for _ in 0..8 {
+        if let Some(bytes) = unsafe { read_bytes(addr, len) } {
+            return Some(bytes);
+        }
+        if len == 1 {
+            break;
+        }
+        len /= 2;
+    }
+    None
 }
 
 fn decode_rm_free(meta: &IoctlMeta, arg_ptr: *mut c_void, root: &mut JsonObject) {
@@ -4755,7 +4948,11 @@ fn json_card_info(idx: usize, entry: &NvIoctlCardInfo) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{c2c_remote_type_name, nvos02_flags_alloc_name, rm_control_cmd_name};
+    use super::{
+        c2c_remote_type_name, deref_user_pointer, looks_like_user_pointer, nvos02_flags_alloc_name,
+        rm_control_cmd_name,
+    };
+    use std::mem::size_of;
 
     #[test]
     fn generated_ctrl_names_fill_unknown_gaps() {
@@ -4798,5 +4995,92 @@ mod tests {
     fn remove_known_unknown_labels_from_common_paths() {
         assert_eq!(c2c_remote_type_name(0), "NONE");
         assert_eq!(nvos02_flags_alloc_name(0), "DEFAULT");
+    }
+
+    #[test]
+    fn deref_pointer_expands_nested_string() {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Inner {
+            tag: u64,
+            str_ptr: u64,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Root {
+            inner_ptr: u64,
+            flags: u64,
+        }
+
+        let text = b"alloc-parms\0";
+        let inner = Inner {
+            tag: 7,
+            str_ptr: text.as_ptr() as u64,
+        };
+        let root = Root {
+            inner_ptr: (&inner as *const Inner) as u64,
+            flags: 0x55aa,
+        };
+        let prefetched = unsafe {
+            std::slice::from_raw_parts((&root as *const Root).cast::<u8>(), size_of::<Root>())
+        };
+
+        let mut visited = Vec::new();
+        let mut budget = 512;
+        let json = deref_user_pointer(
+            (&root as *const Root) as u64,
+            size_of::<Root>(),
+            0,
+            3,
+            64,
+            prefetched,
+            &mut visited,
+            &mut budget,
+        );
+
+        assert!(json.contains("\"status\":\"ok\""));
+        assert!(json.contains("\"ptrFields\""));
+        assert!(json.contains("alloc-parms"));
+    }
+
+    #[test]
+    fn deref_pointer_detects_cycle() {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct LoopNode {
+            next: u64,
+        }
+
+        let mut node = LoopNode { next: 0 };
+        node.next = (&node as *const LoopNode) as u64;
+        let prefetched = unsafe {
+            std::slice::from_raw_parts(
+                (&node as *const LoopNode).cast::<u8>(),
+                size_of::<LoopNode>(),
+            )
+        };
+
+        let mut visited = Vec::new();
+        let mut budget = 128;
+        let json = deref_user_pointer(
+            (&node as *const LoopNode) as u64,
+            size_of::<LoopNode>(),
+            0,
+            4,
+            32,
+            prefetched,
+            &mut visited,
+            &mut budget,
+        );
+
+        assert!(json.contains("cycle_detected"));
+    }
+
+    #[test]
+    fn pointer_heuristic_filters_kernel_space() {
+        assert!(looks_like_user_pointer(0x7fff_0000_1000));
+        assert!(!looks_like_user_pointer(0xffff_8888_0000_0000));
+        assert!(!looks_like_user_pointer(0x123));
     }
 }

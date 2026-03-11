@@ -61,6 +61,22 @@ LD_PRELOAD=../target/debug/libcudatrace.so ./driverapi
   - `off`
 - `LIB_CUDATRACE_MAX_BLOB`:
   - default `256`
+- `LIB_CUDATRACE_DEREF`:
+  - `false` (default)
+  - `true` enables deep pointer dereference for configured ioctl decoders
+- `LIB_CUDATRACE_DEREF_IOCTL`:
+  - comma list of decoder keys allowed for dereference
+  - default `ioctl_rm`
+  - examples: `ioctl_rm`, `ioctl_rm,ioctl_uvm`
+- `LIB_CUDATRACE_MAX_DEPTH`:
+  - max recursive dereference depth
+  - default `3`
+- `LIB_CUDATRACE_MAX_BYTES`:
+  - per-event total dereference read budget (bytes)
+  - default `4096`
+- `LIB_CUDATRACE_HEXDUMP_LEN`:
+  - max bytes read for each pointer node preview/hexdump
+  - default `256`
 - `LIB_CUDATRACE_TIME_UNIT`:
   - `us` (default)
   - `ns`
@@ -96,6 +112,21 @@ Example:
 LIB_CUDATRACE_OUTPUT=stdout \
 LIB_CUDATRACE_TRACE=driver,syscall \
 LIB_CUDATRACE_IOCTL_DECODE=header \
+LD_PRELOAD=$PWD/target/debug/libcudatrace.so \
+./sample/driverapi
+```
+
+Enable deep `ioctl_rm` dereference (`pAllocParms` expansion):
+
+```bash
+LIB_CUDATRACE_OUTPUT=stdout \
+LIB_CUDATRACE_TRACE=syscall \
+LIB_CUDATRACE_IOCTL_DECODE=full \
+LIB_CUDATRACE_DEREF=true \
+LIB_CUDATRACE_DEREF_IOCTL=ioctl_rm \
+LIB_CUDATRACE_MAX_DEPTH=3 \
+LIB_CUDATRACE_MAX_BYTES=4096 \
+LIB_CUDATRACE_HEXDUMP_LEN=256 \
 LD_PRELOAD=$PWD/target/debug/libcudatrace.so \
 ./sample/driverapi
 ```
