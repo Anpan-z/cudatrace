@@ -1,4 +1,4 @@
-use crate::config::IoctlDecodeMode;
+use crate::config::{DerefConfig, IoctlDecodeMode};
 use crate::decode::ioctl_rm::{decode_nvidia_ioctl, outer_cmd_name};
 use crate::decode::ioctl_uvm::{decode_uvm_ioctl, uvm_cmd_name};
 use std::cell::Cell;
@@ -56,6 +56,7 @@ pub fn summarize_ioctl(
     arg_ptr: *mut crate::ffi::c_void,
     decode_mode: IoctlDecodeMode,
     max_blob: usize,
+    deref: DerefConfig,
     fd_path: Option<&str>,
 ) -> String {
     let meta = decode_ioctl_cmd(cmd);
@@ -76,7 +77,7 @@ pub fn summarize_ioctl(
     let decoded = if is_uvm_path(fd_path) {
         decode_uvm_ioctl(&meta, arg_ptr, decode_mode, max_blob)
     } else if is_nvidia_rm_path(fd_path) {
-        decode_nvidia_ioctl(&meta, arg_ptr, decode_mode, max_blob)
+        decode_nvidia_ioctl(&meta, arg_ptr, decode_mode, max_blob, deref)
     } else {
         None
     };
@@ -203,8 +204,9 @@ fn decode_target_pid() -> crate::ffi::pid_t {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DerefConfig;
     use crate::decode::nvidia::{
-        NV_ESC_IOCTL_XFER_CMD, NV_ESC_RM_ALLOC_MEMORY, NV_IOCTL_MAGIC,
+        NV_ESC_IOCTL_XFER_CMD, NV_ESC_RM_ALLOC_MEMORY, NV_ESC_RM_CONTROL, NV_IOCTL_MAGIC,
         NV0000_CTRL_CLIENT_GET_ADDR_SPACE_TYPE_VIDMEM, NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE,
         NV04_CONTROL, Nv0000CtrlClientGetAddrSpaceTypeParams, NvIoctlNvos02ParametersWithFd,
         NvIoctlXfer, NvOs02Parameters, NvOs54Parameters,
@@ -213,6 +215,15 @@ mod tests {
     fn encode_ioctl(dir: u8, ioc_type: u8, nr: u8, size: u16) -> crate::ffi::c_ulong {
         (((dir as u64) << 30) | ((ioc_type as u64) << 8) | (nr as u64) | ((size as u64) << 16))
             as crate::ffi::c_ulong
+    }
+
+    fn default_deref() -> DerefConfig {
+        DerefConfig {
+            enabled: true,
+            max_depth: 2,
+            max_bytes: 1024,
+            hexdump_len: 64,
+        }
     }
 
     #[test]
@@ -230,7 +241,14 @@ mod tests {
     #[test]
     fn summarize_off_mode_stops_at_header() {
         let cmd = encode_ioctl(3, b'F', NV_ESC_IOCTL_XFER_CMD as u8, 16);
-        let summary = summarize_ioctl(cmd, std::ptr::null_mut(), IoctlDecodeMode::Off, 256, None);
+        let summary = summarize_ioctl(
+            cmd,
+            std::ptr::null_mut(),
+            IoctlDecodeMode::Off,
+            256,
+            default_deref(),
+            None,
+        );
         assert!(summary.contains("_IOC"));
         assert!(!summary.contains("args="));
     }
@@ -251,6 +269,7 @@ mod tests {
                 .cast::<crate::ffi::c_void>(),
             IoctlDecodeMode::Header,
             256,
+            default_deref(),
             Some("/dev/nvidiactl"),
         );
 
@@ -289,6 +308,7 @@ mod tests {
                 .cast::<crate::ffi::c_void>(),
             IoctlDecodeMode::Full,
             256,
+            default_deref(),
             Some("/dev/nvidiactl"),
         );
 
@@ -324,6 +344,7 @@ mod tests {
                 .cast::<crate::ffi::c_void>(),
             IoctlDecodeMode::Full,
             256,
+            default_deref(),
             Some("/dev/nvidia-uvm"),
         );
 
@@ -354,6 +375,7 @@ mod tests {
                 .cast::<crate::ffi::c_void>(),
             IoctlDecodeMode::Full,
             256,
+            default_deref(),
             Some("/dev/nvidia-uvm"),
         );
 
@@ -391,6 +413,7 @@ mod tests {
                 .cast::<crate::ffi::c_void>(),
             IoctlDecodeMode::Full,
             256,
+            default_deref(),
             Some("/dev/nvidia0"),
         );
 
@@ -398,5 +421,57 @@ mod tests {
         assert!(summary.contains("\"api\":\"nv_ioctl_nvos02_parameters_with_fd\""));
         assert!(summary.contains("\"hClass\":\"0x71\""));
         assert!(!summary.contains("blob_hex"));
+    }
+
+    #[test]
+    fn summarize_adds_recursive_deref_for_unknown_rm_control_params() {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Nested {
+            value: u32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Params {
+            inner_ptr: u64,
+            marker: u32,
+            _pad: u32,
+        }
+
+        let nested = Nested { value: 0x11223344 };
+        let params = Params {
+            inner_ptr: (&nested as *const Nested) as u64,
+            marker: 0xaabbccdd,
+            _pad: 0,
+        };
+        let os54 = NvOs54Parameters {
+            h_client: 1,
+            h_object: 2,
+            cmd: 0x00ff_ee11,
+            flags: 0,
+            params: (&params as *const Params) as u64,
+            params_size: size_of::<Params>() as u32,
+            status: 0,
+        };
+        let cmd = encode_ioctl(
+            3,
+            b'F',
+            NV_ESC_RM_CONTROL as u8,
+            size_of::<NvOs54Parameters>() as u16,
+        );
+
+        let summary = summarize_ioctl(
+            cmd,
+            (&os54 as *const NvOs54Parameters)
+                .cast_mut()
+                .cast::<crate::ffi::c_void>(),
+            IoctlDecodeMode::Full,
+            256,
+            default_deref(),
+            Some("/dev/nvidiactl"),
+        );
+
+        assert!(summary.contains("\"deref\":{"));
+        assert!(summary.contains("\"children\":["));
     }
 }

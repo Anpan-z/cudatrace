@@ -1,4 +1,4 @@
-use crate::config::IoctlDecodeMode;
+use crate::config::{DerefConfig, IoctlDecodeMode};
 use crate::decode::ioctl::{DecodeSummary, IoctlMeta, hex_bytes, read_bytes, read_pod};
 use crate::decode::ioctl_json::JsonObject;
 use crate::decode::nvidia::{
@@ -45,6 +45,7 @@ mod generated_nvidia_ioctl_tables {
 const MAX_NUMA_ADDRESSES: usize = 16;
 const MAX_CTRL_LIST_ITEMS: usize = 64;
 const MAX_INNER_PREVIEW_WORDS: usize = 8;
+const MAX_DEREF_VISITED: usize = 16;
 
 const NV0000_CTRL_CMD_SYSTEM_GET_FABRIC_STATUS: u32 = 0x0136;
 const NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS_MATRIX: u32 = 0x013a;
@@ -910,6 +911,7 @@ pub fn decode_nvidia_ioctl(
     arg_ptr: *mut c_void,
     decode_mode: IoctlDecodeMode,
     max_blob: usize,
+    deref: DerefConfig,
 ) -> Option<DecodeSummary> {
     if meta.ioc_type != NV_IOCTL_MAGIC {
         return None;
@@ -936,9 +938,11 @@ pub fn decode_nvidia_ioctl(
 
     match meta.nr as u32 {
         NV_ESC_IOCTL_XFER_CMD => {
-            decode_xfer(arg_ptr, decode_mode, max_blob, &mut legacy, &mut root)
+            decode_xfer(arg_ptr, decode_mode, max_blob, deref, &mut legacy, &mut root)
         }
-        NV_ESC_RM_CONTROL => decode_rm_control(meta, arg_ptr, max_blob, &mut legacy, &mut root),
+        NV_ESC_RM_CONTROL => {
+            decode_rm_control(meta, arg_ptr, max_blob, deref, &mut legacy, &mut root)
+        }
         NV_ESC_RM_ALLOC_MEMORY => decode_rm_alloc_memory(meta, arg_ptr, &mut root),
         NV_ESC_RM_ALLOC_OBJECT => decode_rm_alloc_object(meta, arg_ptr, &mut root),
         NV_ESC_RM_ALLOC => decode_rm_alloc(meta, arg_ptr, max_blob, &mut root),
@@ -948,7 +952,9 @@ pub fn decode_nvidia_ioctl(
         NV_ESC_RM_I2C_ACCESS => decode_rm_i2c_access(meta, arg_ptr, &mut root),
         NV_ESC_RM_IDLE_CHANNELS => decode_rm_idle_channels(meta, arg_ptr, &mut root),
         NV_ESC_RM_VID_HEAP_CONTROL => decode_rm_vid_heap_control(meta, arg_ptr, &mut root),
-        NV_ESC_RM_ACCESS_REGISTRY => decode_rm_access_registry(meta, arg_ptr, max_blob, &mut root),
+        NV_ESC_RM_ACCESS_REGISTRY => {
+            decode_rm_access_registry(meta, arg_ptr, max_blob, deref, &mut root)
+        }
         NV_ESC_RM_GET_EVENT_DATA => decode_rm_get_event_data(meta, arg_ptr, &mut root),
         NV_ESC_RM_ALLOC_CONTEXT_DMA2 => decode_rm_alloc_context_dma2(meta, arg_ptr, &mut root),
         NV_ESC_RM_MAP_MEMORY_DMA => decode_rm_map_memory_dma(meta, arg_ptr, &mut root),
@@ -994,6 +1000,7 @@ fn decode_xfer(
     arg_ptr: *mut c_void,
     decode_mode: IoctlDecodeMode,
     max_blob: usize,
+    deref: DerefConfig,
     legacy: &mut String,
     root: &mut JsonObject,
 ) {
@@ -1030,18 +1037,19 @@ fn decode_xfer(
         return;
     };
 
-    decode_nvos54_payload(&os54, max_blob, legacy, root);
+    decode_nvos54_payload(&os54, max_blob, deref, legacy, root);
 }
 
 fn decode_rm_control(
     meta: &IoctlMeta,
     arg_ptr: *mut c_void,
     max_blob: usize,
+    deref: DerefConfig,
     legacy: &mut String,
     root: &mut JsonObject,
 ) {
     match read_checked_pod::<NvOs54Parameters>(meta, arg_ptr) {
-        Ok(os54) => decode_nvos54_payload(&os54, max_blob, legacy, root),
+        Ok(os54) => decode_nvos54_payload(&os54, max_blob, deref, legacy, root),
         Err(err) => root.field_str("status", &err),
     }
 }
@@ -1049,6 +1057,7 @@ fn decode_rm_control(
 fn decode_nvos54_payload(
     os54: &NvOs54Parameters,
     max_blob: usize,
+    deref: DerefConfig,
     legacy: &mut String,
     root: &mut JsonObject,
 ) {
@@ -1086,6 +1095,13 @@ fn decode_nvos54_payload(
     {
         legacy.push_str(&format!(", rmKnown={{{}}}", decoded.legacy));
         root.field_raw("inner", &decoded.json);
+        maybe_add_deref_field(
+            root,
+            os54.params as usize,
+            os54.params_size as usize,
+            max_blob,
+            deref,
+        );
         root.field_str("status", "ok");
         return;
     }
@@ -1113,6 +1129,13 @@ fn decode_nvos54_payload(
         inner.field_raw(&params_type_name, &json_u32_hex_array(&words));
         inner.field_bool("preview_truncated", read_len < os54.params_size as usize);
         root.field_raw("inner", &inner.finish());
+        maybe_add_deref_field(
+            root,
+            os54.params as usize,
+            os54.params_size as usize,
+            max_blob,
+            deref,
+        );
         root.field_str("status", "inner_partial");
     } else {
         inner.field_str("preview", "unreadable");
@@ -1466,6 +1489,7 @@ fn decode_rm_access_registry(
     meta: &IoctlMeta,
     arg_ptr: *mut c_void,
     max_blob: usize,
+    deref: DerefConfig,
     root: &mut JsonObject,
 ) {
     match read_checked_pod::<RmAccessRegistryParams>(meta, arg_ptr) {
@@ -1495,6 +1519,21 @@ fn decode_rm_access_registry(
                     read_remote_string(params.p_parm_str, params.parm_str_length as usize, max_blob)
                 {
                     root.field_str("parmStr", &text);
+                }
+            }
+            if params.p_binary_data != 0 && params.binary_data_length > 0 {
+                let read_len = min(
+                    params.binary_data_length as usize,
+                    min(max_blob.max(16), deref.hexdump_len),
+                );
+                if let Some(bytes) = unsafe { read_bytes(params.p_binary_data as usize, read_len) } {
+                    root.field_str("binaryDataHex", &hex_bytes(&bytes));
+                    root.field_bool(
+                        "binaryDataTruncated",
+                        read_len < params.binary_data_length as usize,
+                    );
+                } else {
+                    root.field_str("binaryDataStatus", "unreadable");
                 }
             }
             root.field_str("status", "ok");
@@ -4311,6 +4350,126 @@ fn valid_gpu_ids(all_ids: &[u32]) -> Vec<u32> {
         out.push(*gpu_id);
     }
     out
+}
+
+#[derive(Debug)]
+struct DerefState {
+    visited: Vec<usize>,
+    remaining_bytes: usize,
+}
+
+fn maybe_add_deref_field(
+    root: &mut JsonObject,
+    params_addr: usize,
+    params_size: usize,
+    max_blob: usize,
+    deref: DerefConfig,
+) {
+    if !deref.enabled || params_addr == 0 || deref.max_depth == 0 || deref.max_bytes == 0 {
+        return;
+    }
+    let mut state = DerefState {
+        visited: Vec::with_capacity(MAX_DEREF_VISITED),
+        remaining_bytes: deref.max_bytes.min(max_blob.max(16)),
+    };
+    let deref_json = deref_pointer_value(params_addr, params_size, deref, 0, &mut state);
+    root.field_raw("deref", &deref_json);
+}
+
+fn deref_pointer_value(
+    addr: usize,
+    size_hint: usize,
+    cfg: DerefConfig,
+    depth: usize,
+    state: &mut DerefState,
+) -> String {
+    let mut obj = JsonObject::new();
+    obj.field_str("ptr", &format!("0x{addr:x}"));
+    obj.field_u64("depth", depth as u64);
+
+    if addr == 0 {
+        obj.field_str("status", "null");
+        return obj.finish();
+    }
+    if depth >= cfg.max_depth {
+        obj.field_str("status", "max_depth");
+        return obj.finish();
+    }
+    if state.remaining_bytes == 0 {
+        obj.field_str("status", "budget_exhausted");
+        return obj.finish();
+    }
+    if state.visited.contains(&addr) {
+        obj.field_str("status", "cycle");
+        return obj.finish();
+    }
+    if state.visited.len() >= MAX_DEREF_VISITED {
+        obj.field_str("status", "visited_limit");
+        return obj.finish();
+    }
+    state.visited.push(addr);
+
+    let read_len = min(size_hint.max(1), min(cfg.hexdump_len.max(1), state.remaining_bytes));
+    let Some(bytes) = (unsafe { read_bytes(addr, read_len) }) else {
+        obj.field_str("status", "unreadable");
+        let _ = state.visited.pop();
+        return obj.finish();
+    };
+    state.remaining_bytes = state.remaining_bytes.saturating_sub(bytes.len());
+
+    obj.field_u64("read_len", bytes.len() as u64);
+    obj.field_str("hex", &hex_bytes(&bytes));
+    obj.field_bool("truncated", read_len < size_hint);
+    if let Some(text) = bytes_to_cstring(&bytes) {
+        obj.field_str("str", &text);
+    }
+
+    if depth + 1 < cfg.max_depth && bytes.len() >= size_of::<u64>() {
+        let mut children = String::from("[");
+        let mut first = true;
+        for chunk in bytes.chunks_exact(size_of::<u64>()).take(4) {
+            let candidate = u64::from_ne_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ]) as usize;
+            if candidate < 0x1000 || candidate == addr {
+                continue;
+            }
+            if !first {
+                children.push(',');
+            }
+            first = false;
+            children.push_str(&deref_pointer_value(
+                candidate,
+                cfg.hexdump_len,
+                cfg,
+                depth + 1,
+                state,
+            ));
+        }
+        children.push(']');
+        if !first {
+            obj.field_raw("children", &children);
+        }
+    }
+
+    obj.field_str("status", "ok");
+    let _ = state.visited.pop();
+    obj.finish()
+}
+
+fn bytes_to_cstring(bytes: &[u8]) -> Option<String> {
+    let nul = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    if nul == 0 {
+        return None;
+    }
+    let slice = &bytes[..nul];
+    if !slice
+        .iter()
+        .all(|b| b.is_ascii_graphic() || b.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(String::from_utf8_lossy(slice).into_owned())
 }
 
 fn read_remote_string(ptr: u64, length: usize, max_blob: usize) -> Option<String> {

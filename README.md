@@ -61,6 +61,18 @@ LD_PRELOAD=../target/debug/libcudatrace.so ./driverapi
   - `off`
 - `LIB_CUDATRACE_MAX_BLOB`:
   - default `256`
+- `LIB_CUDATRACE_DEREF`:
+  - `on` (default)
+  - `off`
+- `LIB_CUDATRACE_MAX_DEREF_DEPTH`:
+  - max recursive pointer dereference depth
+  - default `2`
+- `LIB_CUDATRACE_MAX_DEREF_BYTES`:
+  - max total bytes copied for recursive dereference per ioctl event
+  - default `1024`
+- `LIB_CUDATRACE_HEXDUMP_LEN`:
+  - max bytes to hex dump for one dereferenced pointer/buffer
+  - default `64`
 - `LIB_CUDATRACE_TIME_UNIT`:
   - `us` (default)
   - `ns`
@@ -98,6 +110,41 @@ LIB_CUDATRACE_TRACE=driver,syscall \
 LIB_CUDATRACE_IOCTL_DECODE=header \
 LD_PRELOAD=$PWD/target/debug/libcudatrace.so \
 ./sample/driverapi
+```
+
+## ioctl deep-dereference demo (nested pointers)
+
+Build demo:
+
+```bash
+cc -O2 sample/ioctl_deref_demo.c -o sample/ioctl_deref_demo
+```
+
+Run with cudatrace:
+
+```bash
+LIB_CUDATRACE_OUTPUT=stdout \
+LIB_CUDATRACE_TRACE=syscall \
+LIB_CUDATRACE_IOCTL_DECODE=full \
+LIB_CUDATRACE_DEREF=on \
+LIB_CUDATRACE_MAX_DEREF_DEPTH=3 \
+LIB_CUDATRACE_MAX_DEREF_BYTES=2048 \
+LIB_CUDATRACE_HEXDUMP_LEN=64 \
+LD_PRELOAD=$PWD/target/debug/libcudatrace.so \
+./sample/ioctl_deref_demo
+```
+
+Before (`LIB_CUDATRACE_DEREF=off`): only first-level pointers are visible.
+
+```json
+"inner":{"cmd_raw":"0xffee11","cmd_name":"UNKNOWN","params_size":32,"paramsPreview":["0x7ff...","0x7ff..."],"preview_truncated":false}
+```
+
+After (`LIB_CUDATRACE_DEREF=on`): additional recursive dereference is attached without breaking existing fields.
+
+```json
+"inner":{"cmd_raw":"0xffee11","cmd_name":"UNKNOWN","params_size":32,"paramsPreview":["0x7ff...","0x7ff..."],"preview_truncated":false},
+"deref":{"ptr":"0x7ff...","depth":0,"read_len":32,"hex":"...","children":[{"ptr":"0x7ff...","depth":1,"read_len":16,"str":"outer-message","status":"ok"}],"status":"ok"}
 ```
 
 Notes for ptrace syscall tracing:
